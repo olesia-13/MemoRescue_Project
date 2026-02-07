@@ -29,7 +29,7 @@ STILLNESS_VEL_THRESH = 0.003
 
 IDENTIFY_EVERY = 30             
 ALERT_COOLDOWN = 60             
-ANOMALY_CONFIRM_TIME = 2.0      # Час для підтвердження тривоги
+ANOMALY_CONFIRM_TIME = 5.0      # Час для підтвердження тривоги
 
 if TELEGRAM_BOT_TOKEN is None:
     print("[ERROR] Токен не знайдено! Перевірте файл .env")
