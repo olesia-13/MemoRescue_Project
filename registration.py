@@ -7,18 +7,16 @@ import os
 import time
 import tempfile
 
-# Ініціалізація MediaPipe
+# --- Ініціалізація MediaPipe ---
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(static_image_mode=False, min_detection_confidence=0.5)
 
-
 def _calculate_angle(a, b, c):
-    """Обчислює кут у точці b за трьома landmarks"""
+    """Обчислює кут у точці b за трьома landmarks (у радіанах)"""
     va = np.array([a.x - b.x, a.y - b.y])
     vc = np.array([c.x - b.x, c.y - b.y])
     cos_angle = np.dot(va, vc) / (np.linalg.norm(va) * np.linalg.norm(vc) + 1e-6)
     return float(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
-
 
 def _extract_frame_features(landmarks):
     """Витягує вектор ознак з одного кадру (7 ознак)"""
@@ -32,6 +30,7 @@ def _extract_frame_features(landmarks):
     l_ankle = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE]
     r_ankle = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE]
 
+    # Використовуємо зріст як коефіцієнт нормалізації
     height = abs(nose.y - l_ankle.y)
     if height < 0.01:
         return None
@@ -46,48 +45,40 @@ def _extract_frame_features(landmarks):
 
     return [ankle_dist, l_knee_angle, r_knee_angle, l_hip_angle, r_hip_angle, shoulder_w, step_h]
 
-
 def calculate_gait_signature(video_path):
-    """Витягує вектор ознак ходьби з відео (7-елементний вектор)"""
+    """Аналізує відео та повертає усереднений вектор ходьби"""
     cap = cv2.VideoCapture(video_path)
     all_features = []
-
     frame_count = 0
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        if frame_count % 5 == 0:
+        if frame_count % 5 == 0:  # Обробляємо кожен 5-й кадр для швидкості
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
-
             if results.pose_landmarks:
                 feats = _extract_frame_features(results.pose_landmarks.landmark)
                 if feats is not None:
                     all_features.append(feats)
-
         frame_count += 1
 
     cap.release()
-
     if len(all_features) > 0:
         return np.mean(all_features, axis=0).tolist()
     return None
 
-
-RECORD_SECONDS = 10  # тривалість запису з камери
-
-
-def record_from_camera(duration=RECORD_SECONDS):
-    """Записує відео з вебкамери протягом duration секунд, повертає шлях до файлу."""
+def record_from_camera(duration=10):
+    """Записує відео з вебкамери"""
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         return None
 
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 20.0
+    fps = 20.0
 
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     tmp_path = tmp.name
@@ -107,78 +98,73 @@ def record_from_camera(duration=RECORD_SECONDS):
     cap.release()
     return tmp_path
 
-
-def _save_profile(name, phone, video_path):
-    """Спільна логіка: аналіз відео → збереження профілю."""
+def _save_profile(name, phone, chat_id, video_path):
+    """Аналізує відео та зберігає дані в базу (папка database)"""
     signature = calculate_gait_signature(video_path)
 
-    # прибираємо тимчасовий файл
     if os.path.exists(video_path):
         os.remove(video_path)
 
     if signature is None:
-        st.error("The skeleton in the video could not be recognized. Try a different video.")
+        st.error("Не вдалося розпізнати людину на відео. Спробуйте інше відео.")
         return
 
     if not os.path.exists("database"):
         os.makedirs("database")
 
+    # Формуємо дані профілю, включаючи Chat ID
     user_data = {
         "name": name,
         "phone": phone,
+        "chat_id": chat_id,
         "gait_signature": signature,
     }
-    with open(f"database/{name.replace(' ', '_')}.json", "w", encoding="utf-8") as f:
+
+    file_name = f"database/{name.replace(' ', '_')}.json"
+    with open(file_name, "w", encoding="utf-8") as f:
         json.dump(user_data, f, ensure_ascii=False, indent=4)
 
-    st.success(f"Profile for {name} has been successfully created!")
-    st.metric("Gait vector dimension", len(signature))
-
+    st.success(f"Профіль для {name} успішно створено!")
+    st.info(f"Сповіщення будуть надсилатися на Telegram ID: {chat_id}")
 
 # --- ІНТЕРФЕЙС STREAMLIT ---
-st.set_page_config(page_title="Registration MemoRescue", page_icon="👤")
+st.set_page_config(page_title="MemoRescue Registration", page_icon="👤")
 
-st.title("Registration in MemoRescue system")
-st.write("Upload user data to create a digital walking profile.")
+st.title("👤 Реєстрація в системі MemoRescue")
+st.write("Заповніть дані та створіть цифровий профіль ходьби.")
 
-name = st.text_input("Username")
-guardian_phone = st.text_input("Phone number of the trusted person")
+# Поля введення
+name = st.text_input("Ім'я користувача (підопічного)")
+guardian_phone = st.text_input("Номер телефону опікуна (для відображення)")
+guardian_chat_id = st.text_input("Telegram Chat ID опікуна (дізнайтеся через @userinfobot)")
 
-tab_upload, tab_record = st.tabs(["Upload video", "Record from camera"])
+# Вкладки для відео
+tab_upload, tab_record = st.tabs(["Завантажити відео", "Записати з камери"])
 
-# ── Вкладка 1: завантаження файлу ──
 with tab_upload:
-    video_file = st.file_uploader(
-        "Upload a walking video (baseline)", type=["mp4", "mov", "avi"]
-    )
-    upload_btn = st.button("Create profile (upload)", key="btn_upload")
-
-    if upload_btn:
-        if not name or not guardian_phone:
-            st.warning("Please fill in the name and phone fields above.")
+    video_file = st.file_uploader("Виберіть файл (mp4, mov, avi)", type=["mp4", "mov", "avi"])
+    if st.button("Створити профіль (завантаження)", key="btn_upload"):
+        if not name or not guardian_phone or not guardian_chat_id:
+            st.warning("Будь ласка, заповніть всі поля вище.")
         elif not video_file:
-            st.warning("Please upload a video first.")
+            st.warning("Будь ласка, спочатку завантажте відео.")
         else:
-            with st.spinner("Analyzing walking... wait."):
+            with st.spinner("Аналіз ходьби... зачекайте."):
                 temp_path = "temp_video.mp4"
                 with open(temp_path, "wb") as f:
                     f.write(video_file.read())
-                _save_profile(name, guardian_phone, temp_path)
+                _save_profile(name, guardian_phone, guardian_chat_id, temp_path)
 
-# ── Вкладка 2: запис з камери ──
 with tab_record:
-    st.info(f"Click the button below — the camera will record for {RECORD_SECONDS} seconds. "
-            "Walk naturally in front of the camera.")
-    record_btn = st.button("Start recording", key="btn_record")
-
-    if record_btn:
-        if not name or not guardian_phone:
-            st.warning("Please fill in the name and phone fields above.")
+    st.info("Після натискання кнопки камера записуватиме 10 секунд. Пройдіться перед нею природною ходою.")
+    if st.button("Почати запис з камери", key="btn_record"):
+        if not name or not guardian_phone or not guardian_chat_id:
+            st.warning("Будь ласка, заповніть всі поля вище.")
         else:
-            with st.spinner(f"Recording {RECORD_SECONDS}s from camera..."):
-                rec_path = record_from_camera(RECORD_SECONDS)
-            if rec_path is None:
-                st.error("Cannot open camera! Check that the webcam is connected.")
+            with st.spinner("Запис..."):
+                rec_path = record_from_camera(10)
+            if rec_path:
+                with st.spinner("Аналіз ходьби..."):
+                    _save_profile(name, guardian_phone, guardian_chat_id, rec_path)
             else:
-                with st.spinner("Analyzing walking... wait."):
-                    _save_profile(name, guardian_phone, rec_path)
+                st.error("Камера не знайдена!")

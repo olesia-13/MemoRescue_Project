@@ -1,277 +1,208 @@
-"""
-MemoRescue — Крок 3-5: Моніторинг з камери
-  • Виявлення скелета через MediaPipe
-  • Ідентифікація людини (cosine similarity ≥ 0.85)
-  • Аналіз аномалій: зигзаг центру мас / тривала нерухомість
-"""
-
+from dotenv import load_dotenv
 import cv2
 import mediapipe as mp
 import numpy as np
 import json
 import os
+import requests
+import time
 from collections import deque
 from scipy.spatial.distance import cosine
 
-# ── Налаштування ────────────────────────────────────────────
+load_dotenv()
+
+# Вкажіть точні координати місця встановлення камери
+CAMERA_LAT = 50.5186  
+CAMERA_LON = 30.2397
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+# ── ЗАГАЛЬНІ НАЛАШТУВАННЯ СИСТЕМИ ───────────────────────────
 DATABASE_DIR = os.path.join(os.path.dirname(__file__), "database")
-SIMILARITY_THRESHOLD = 0.85     # поріг cosine-схожості
-QUEUE_SIZE = 100                # черга останніх кадрів
+SIMILARITY_THRESHOLD = 0.85     
+QUEUE_SIZE = 100                
 
-ZIGZAG_WINDOW = 60              # вікно для детекції зигзагу (кадри)
-ZIGZAG_SMOOTH = 10              # ковзне середнє для згладжування природного хитання
-ZIGZAG_SINUOSITY = 2.5          # поріг звивистості (path_length / displacement)
+ZIGZAG_WINDOW = 60              
+ZIGZAG_SINUOSITY = 2.5          
+STILLNESS_FRAMES = 90           
+STILLNESS_VEL_THRESH = 0.003    
 
-STILLNESS_VEL_THRESH = 0.003    # поріг швидкості (нормалізовані коорд.)
-STILLNESS_FRAMES = 90           # скільки кадрів нерухомості = тривога (~3 сек)
+IDENTIFY_EVERY = 30             
+ALERT_COOLDOWN = 60             
+ANOMALY_CONFIRM_TIME = 2.0      # Час для підтвердження тривоги
 
-IDENTIFY_EVERY = 30             # перерахунок ідентифікації кожні N кадрів
-MIN_FEATURES_FOR_ID = 20        # мін. кадрів у буфері для порівняння
+if TELEGRAM_BOT_TOKEN is None:
+    print("[ERROR] Токен не знайдено! Перевірте файл .env")
+else:
+    print(f"[INFO] Токен успішно завантажено: {TELEGRAM_BOT_TOKEN[:10]}...")
+    
+# Словники стану
+last_alerts = {}
+anomaly_start_time = None       
 
-# ── MediaPipe ───────────────────────────────────────────────
+# ── MEDIAPIPE ІНІЦІАЛІЗАЦІЯ ─────────────────────────────────
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 pose = mp_pose.Pose(
     static_image_mode=False,
     min_detection_confidence=0.5,
-    min_tracking_confidence=0.5,
+    min_tracking_confidence=0.5
 )
 
-
-# ── Допоміжні функції ──────────────────────────────────────
-def _angle(a, b, c):
-    """Кут у точці b (рад.)."""
-    va = np.array([a.x - b.x, a.y - b.y])
-    vc = np.array([c.x - b.x, c.y - b.y])
-    cos_a = np.dot(va, vc) / (np.linalg.norm(va) * np.linalg.norm(vc) + 1e-6)
-    return float(np.arccos(np.clip(cos_a, -1.0, 1.0)))
-
-
-def extract_features(landmarks):
-    """7-елементний вектор ознак з одного кадру (той самий, що і в registration)."""
-    nose = landmarks[mp_pose.PoseLandmark.NOSE]
-    l_sh = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
-    r_sh = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
-    l_hip = landmarks[mp_pose.PoseLandmark.LEFT_HIP]
-    r_hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP]
-    l_kn = landmarks[mp_pose.PoseLandmark.LEFT_KNEE]
-    r_kn = landmarks[mp_pose.PoseLandmark.RIGHT_KNEE]
-    l_an = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE]
-    r_an = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE]
-
-    height = abs(nose.y - l_an.y)
-    if height < 0.01:
-        return None
-
-    ankle_dist = np.sqrt((l_an.x - r_an.x) ** 2 + (l_an.y - r_an.y) ** 2) / height
-    l_knee_a = _angle(l_hip, l_kn, l_an)
-    r_knee_a = _angle(r_hip, r_kn, r_an)
-    l_hip_a = _angle(l_sh, l_hip, l_kn)
-    r_hip_a = _angle(r_sh, r_hip, r_kn)
-    shoulder_w = np.sqrt((l_sh.x - r_sh.x) ** 2 + (l_sh.y - r_sh.y) ** 2) / height
-    step_h = abs(l_an.y - r_an.y) / height
-
-    return [ankle_dist, l_knee_a, r_knee_a, l_hip_a, r_hip_a, shoulder_w, step_h]
-
-
-def get_pelvis(landmarks):
-    """Центр мас ≈ середина між лівим і правим стегном (таз)."""
-    l = landmarks[mp_pose.PoseLandmark.LEFT_HIP]
-    r = landmarks[mp_pose.PoseLandmark.RIGHT_HIP]
-    return np.array([(l.x + r.x) / 2, (l.y + r.y) / 2])
-
-
-# ── База даних ─────────────────────────────────────────────
-def load_database():
-    """Завантажує всі JSON-профілі з папки database."""
-    users = []
-    if not os.path.exists(DATABASE_DIR):
-        return users
-    for fn in os.listdir(DATABASE_DIR):
-        if not fn.endswith(".json"):
-            continue
-        with open(os.path.join(DATABASE_DIR, fn), "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # пропускаємо старий формат (одне число)
-        if not isinstance(data.get("gait_signature"), list):
-            continue
-        users.append(data)
-    return users
-
-
-# ── Ідентифікація ──────────────────────────────────────────
-def identify_person(current_vec, users):
-    """Повертає (user_dict, similarity) або (None, best_sim)."""
-    best_user = None
-    best_sim = -1.0
-    for u in users:
-        sig = u["gait_signature"]
-        sim = 1.0 - cosine(current_vec, sig)
-        if sim > best_sim:
-            best_sim = sim
-            best_user = u
-    if best_sim >= SIMILARITY_THRESHOLD:
-        return best_user, best_sim
-    return None, best_sim
-
-
-# ── Детекція аномалій ──────────────────────────────────────
-def _smooth(pts, window):
-    """Ковзне середнє для списку 2D-точок."""
-    if len(pts) < window:
-        return pts
-    kernel = np.ones(window) / window
-    xs = np.convolve([p[0] for p in pts], kernel, mode="valid")
-    ys = np.convolve([p[1] for p in pts], kernel, mode="valid")
-    return [np.array([x, y]) for x, y in zip(xs, ys)]
-
-
-def detect_zigzag(positions):
-    """
-    Зигзаг = звивистість (sinuosity) згладженої траєкторії.
-    sinuosity = сумарна довжина шляху / пряма відстань між початком і кінцем.
-    Нормальна ходьба ≈ 1.0–2.0, зигзаг > ZIGZAG_SINUOSITY.
-    Згладжування прибирає природне хитання тазу при кожному кроці.
-    """
-    if len(positions) < ZIGZAG_WINDOW:
-        return False
-
-    raw = list(positions)[-ZIGZAG_WINDOW:]
-    pts = _smooth(raw, ZIGZAG_SMOOTH)
-
-    if len(pts) < 3:
-        return False
-
-    # пряма відстань від початку до кінця
-    displacement = np.linalg.norm(pts[-1] - pts[0])
-    if displacement < 0.005:
-        # людина майже не зрушила з місця — це не зигзаг, а можливо нерухомість
-        return False
-
-    # сумарна довжина шляху
-    path_len = sum(np.linalg.norm(pts[i] - pts[i - 1]) for i in range(1, len(pts)))
-
-    sinuosity = path_len / displacement
-    return sinuosity > ZIGZAG_SINUOSITY
-
-
-def detect_stillness(positions):
-    """
-    Нерухомість = швидкість < порогу впродовж STILLNESS_FRAMES кадрів (~3 с).
-    """
-    if len(positions) < STILLNESS_FRAMES:
-        return False
-
-    pts = list(positions)[-STILLNESS_FRAMES:]
-    for i in range(1, len(pts)):
-        if np.linalg.norm(pts[i] - pts[i - 1]) > STILLNESS_VEL_THRESH:
-            return False
-    return True
-
-
-# ── Головний цикл моніторингу ──────────────────────────────
-def run_monitor():
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[ERROR] Не вдалося відкрити камеру!")
+# ── ФУНКЦІЯ TELEGRAM ────────────────────────────────────────
+def send_telegram_alert(user_name, phone, chat_id, alert_type):
+    """Надсилає сповіщення з координатами камери та посиланням на карту."""
+    if not chat_id:
+        print(f"[WARN] Chat ID для {user_name} не знайдено.")
         return
 
+    # Формуємо посилання на Google Maps
+    maps_link = f"https://www.google.com/maps?q={49.8441550958368},{24.026250638148717}"
+    
+    emoji = "🚨" if alert_type == "ZIGZAG" else "⚠️"
+    message = (
+        f"{emoji} MemoRescue: ПІДТВЕРДЖЕНО ТРИВОГУ!!!\n"
+        f"----------------------------------\n"
+        f"👤 Особа: {user_name}\n"
+        f"🔗 Карта: {maps_link}\n"
+        f"⏰ Час: {time.strftime('%H:%M:%S')}"
+    )
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        payload = {"chat_id": chat_id, "text": message}
+        requests.post(url, data=payload)
+        print(f"[SUCCESS] Тривогу з геолокацією надіслано для {user_name}")
+    except Exception as e:
+        print(f"[ERROR] Не вдалося надіслати повідомлення: {e}")
+
+# ── ДОПОМІЖНІ ФУНКЦІЇ АНАЛІЗУ ──────────────────────────────
+def _angle(a, b, c):
+    va = np.array([a.x - b.x, a.y - b.y])
+    vc = np.array([c.x - b.x, c.y - b.y])
+    n_a, n_c = np.linalg.norm(va), np.linalg.norm(vc)
+    if n_a < 1e-6 or n_c < 1e-6: return 0.0
+    return float(np.arccos(np.clip(np.dot(va, vc) / (n_a * n_c), -1.0, 1.0)))
+
+def extract_features(landmarks):
+    try:
+        lm = landmarks
+        nose = lm[mp_pose.PoseLandmark.NOSE]
+        l_an, r_an = lm[mp_pose.PoseLandmark.LEFT_ANKLE], lm[mp_pose.PoseLandmark.RIGHT_ANKLE]
+        l_hip, r_hip = lm[mp_pose.PoseLandmark.LEFT_HIP], lm[mp_pose.PoseLandmark.RIGHT_HIP]
+        l_kn, r_kn = lm[mp_pose.PoseLandmark.LEFT_KNEE], lm[mp_pose.PoseLandmark.RIGHT_KNEE]
+        l_sh, r_sh = lm[mp_pose.PoseLandmark.LEFT_SHOULDER], lm[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+        h = abs(nose.y - l_an.y)
+        if h < 0.01: return None
+        return [np.sqrt((l_an.x-r_an.x)**2+(l_an.y-r_an.y)**2)/h, _angle(l_hip,l_kn,l_an), _angle(r_hip,r_kn,r_an),
+                _angle(l_sh,l_hip,l_kn), _angle(r_sh,r_hip,r_kn), np.sqrt((l_sh.x-r_sh.x)**2+(l_sh.y-r_sh.y)**2)/h, abs(l_an.y-r_an.y)/h]
+    except: return None
+
+def load_database():
+    users = []
+    if not os.path.exists(DATABASE_DIR): return users
+    for fn in os.listdir(DATABASE_DIR):
+        if fn.endswith(".json"):
+            with open(os.path.join(DATABASE_DIR, fn), "r", encoding="utf-8") as f:
+                users.append(json.load(f))
+    return users
+
+def identify_person(current_vec, users):
+    best_u, best_s = None, -1.0
+    curr = np.array(current_vec).flatten()
+    for u in users:
+        sig = np.array(u["gait_signature"]).flatten()
+        if curr.shape == sig.shape:
+            sim = 1.0 - cosine(curr, sig)
+            if sim > best_s: best_s, best_u = sim, u
+    return (best_u, best_s) if best_s >= SIMILARITY_THRESHOLD else (None, best_s)
+
+def detect_zigzag(positions):
+    if len(positions) < ZIGZAG_WINDOW: return False
+    pts = list(positions)[-ZIGZAG_WINDOW:]
+    disp = np.linalg.norm(pts[-1] - pts[0])
+    if disp < 0.01: return False
+    path = sum(np.linalg.norm(pts[i]-pts[i-1]) for i in range(1, len(pts)))
+    return (path / disp) > ZIGZAG_SINUOSITY
+
+def detect_stillness(positions):
+    if len(positions) < STILLNESS_FRAMES: return False
+    pts = list(positions)[-STILLNESS_FRAMES:]
+    return all(np.linalg.norm(pts[i]-pts[i-1]) < STILLNESS_VEL_THRESH for i in range(1, len(pts)))
+
+# ── ГОЛОВНИЙ ЦИКЛ ───────────────────────────────────────────
+def run_monitor():
+    global anomaly_start_time
+    cap = cv2.VideoCapture(0)
     users = load_database()
-    print(f"[INFO] Завантажено профілів: {len(users)}")
-    if len(users) == 0:
-        print("[WARN] Немає профілів з векторним gait_signature. "
-              "Перереєструйте користувачів через registration.py")
-    print("[INFO] Камера запущена. Натисніть 'q' для виходу.\n")
+    print(f"[INFO] Камера активована. Профілів у базі: {len(users)}")
 
-    feature_buf = deque(maxlen=QUEUE_SIZE)   # для ідентифікації
-    pos_queue = deque(maxlen=QUEUE_SIZE)     # для аномалій
-
+    feature_buf = deque(maxlen=QUEUE_SIZE)
+    pos_queue = deque(maxlen=QUEUE_SIZE)
     identified = None
-    alarm_type = None
     frame_idx = 0
 
-    while True:
+    while cap.isOpened():
         ok, frame = cap.read()
-        if not ok:
-            break
-
+        if not ok: break
         frame = cv2.flip(frame, 1)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = pose.process(rgb)
 
-        label = "Scanning..."
-        color = (255, 255, 0)
+        label, color = "Scanning...", (255, 255, 0)
 
         if results.pose_landmarks:
-            mp_drawing.draw_landmarks(
-                frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS
-            )
+            mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
             lm = results.pose_landmarks.landmark
-
-            # ── Збираємо ознаки ──
             feats = extract_features(lm)
-            if feats is not None:
+            if feats:
                 feature_buf.append(feats)
+                pos_queue.append(np.array([(lm[23].x+lm[24].x)/2, (lm[23].y+lm[24].y)/2]))
 
-            pelvis = get_pelvis(lm)
-            pos_queue.append(pelvis)
+            # Ідентифікація
+            if frame_idx % IDENTIFY_EVERY == 0 and len(feature_buf) >= 20:
+                avg_vec = np.mean(list(feature_buf), axis=0).tolist()
+                identified, sim = identify_person(avg_vec, users)
 
-            # ── Ідентифікація ──
-            if (frame_idx % IDENTIFY_EVERY == 0
-                    and len(feature_buf) >= MIN_FEATURES_FOR_ID
-                    and len(users) > 0):
-                sig = np.mean(list(feature_buf), axis=0).tolist()
-                person, sim = identify_person(sig, users)
-                if person:
-                    identified = person
-                    label = f"{person['name']}  (sim {sim:.2f})"
-                    color = (0, 255, 0)
-                else:
-                    identified = None
-                    label = f"Unknown (best {sim:.2f})"
+            if identified:
+                label, color = f"OK: {identified['name']}", (0, 255, 0)
+                
+                # Аналіз аномалій
+                active_anomaly = None
+                if detect_zigzag(pos_queue): active_anomaly = "ZIGZAG"
+                elif detect_stillness(pos_queue): active_anomaly = "STILLNESS"
+
+                if active_anomaly:
+                    if anomaly_start_time is None: 
+                        anomaly_start_time = time.time()
+                    
+                    elapsed = time.time() - anomaly_start_time
+                    label = f"CONFIRMING {active_anomaly}: {elapsed:.1f}s"
                     color = (0, 165, 255)
 
-            # ── Аномалії (тільки якщо людина ідентифікована) ──
-            alarm_type = None
-            if identified and len(pos_queue) >= ZIGZAG_WINDOW:
-                if detect_zigzag(pos_queue):
-                    alarm_type = "ZIGZAG"
-                elif detect_stillness(pos_queue):
-                    alarm_type = "STILLNESS"
-
-            # ── Відображення ──
-            if alarm_type:
-                label = f"ALARM [{alarm_type}] — {identified['name']}"
-                color = (0, 0, 255)
-                cv2.putText(frame, f"Call: {identified['phone']}",
-                            (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                            (0, 0, 255), 2)
-                # червона рамка
-                h, w = frame.shape[:2]
-                cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 0, 255), 4)
-            elif identified:
-                label = f"OK: {identified['name']}"
-                color = (0, 255, 0)
+                    if elapsed >= ANOMALY_CONFIRM_TIME:
+                        label = f"!!! ALARM {active_anomaly} !!!"
+                        color = (0, 0, 255)
+                        u_name = identified['name']
+                        if time.time() - last_alerts.get(u_name, 0) > ALERT_COOLDOWN:
+                            send_telegram_alert(u_name, identified['phone'], identified.get('chat_id'), active_anomaly)
+                            last_alerts[u_name] = time.time()
+                else:
+                    anomaly_start_time = None
+            else:
+                label, color = "Unknown", (0, 165, 255)
         else:
-            label = "No person"
-            color = (128, 128, 128)
+            label, color = "No person", (128, 128, 128)
+            anomaly_start_time = None
 
-        cv2.putText(frame, label, (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        cv2.putText(frame, f"Queue: {len(pos_queue)}/{QUEUE_SIZE}",
-                    (10, frame.shape[0] - 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-
-        cv2.imshow("MemoRescue Monitor", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
+        cv2.putText(frame, label, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        cv2.imshow(f"MemoRescue Monitor", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
         frame_idx += 1
 
     cap.release()
     cv2.destroyAllWindows()
-    print("[INFO] Моніторинг завершено.")
-
 
 if __name__ == "__main__":
     run_monitor()
+
