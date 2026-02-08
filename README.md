@@ -12,7 +12,7 @@
 
 ---
 
-## 📑 Table of Contents
+##  Table of Contents
 
 * [Problem](#-problem)
 * [Solution](#-solution)
