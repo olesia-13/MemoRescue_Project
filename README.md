@@ -130,7 +130,7 @@ TELEGRAM_BOT_TOKEN=your_token_here
 streamlit run registration.py
 ```
 Отримайте id вашого  Telegram чату через @userinfobot та впишіть його при реєстрації
-Напишіть /start у боті ![MemoRescue](http://t.me/MemoRescue_bot)
+Напишіть /start у боті [MemoRescue](http://t.me/MemoRescue_bot)
 
 Профілі зберігаються у:
 
