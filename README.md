@@ -188,9 +188,9 @@ Press `q` to exit.
 
 Developed by A.I.D.O.
 
-* Denis tarasenko
+* Denis Tarasenko
 * Nadia Lynovitsyka
-* Olesia osipova
+* Olesia Osipova
 * Vladyslava Polishchyk
 
 ---
